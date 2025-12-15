@@ -13,7 +13,8 @@
         "test": "echo \"Error: no test specified\" && exit 1",
         "build": "tsc",
         "watch": "tsc-watch --onSuccess \"echo 'Build completed'\"",
-        "dev": "tsc -w"
+        "dev": "tsc -w",
+        "prepare": "npm run build"
     },
     "keywords": [
         "tiptap",
