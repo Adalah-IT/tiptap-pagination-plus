@@ -126,16 +126,6 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
         display: grid;
         min-width: 100%;
       }
-      .rm-with-pagination table {
-        border-collapse: collapse;
-        width: 100%;
-        display: contents;
-      }
-      .rm-with-pagination table tbody{
-        display: table;
-        max-height: 300px;
-        overflow-y: auto;
-      }
       .rm-with-pagination table tbody > tr{
         display: table-row !important;
       }
