@@ -197,6 +197,10 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
         max-height: calc(calc(var(--rm-page-height) * 0.35) - var(--rm-content-margin-bottom) - var(--rm-margin-bottom));
         overflow-y: hidden;
       }
+      .rm-with-pagination .rm-merge-rect {
+          pointer-events: none;
+      }
+    .rm-with-pagination .rm-merge-surface { pointer-events: none; }
     `;
     document.head.appendChild(style);
 
