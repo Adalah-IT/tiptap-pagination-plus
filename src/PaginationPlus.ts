@@ -25,6 +25,32 @@ export interface PaginationPlusOptions {
 }
 const page_count_meta_key = "PAGE_COUNT_META_KEY";
 
+// Per-editor rAF recalc scheduler, registered by addProseMirrorPlugins so the
+// onCreate MutationObserver can reach it without a circular closure.
+const schedulers = new WeakMap<object, () => void>();
+
+// The single canonical options object the plugin reads. tiptap hands different
+// `this.options` references to addCommands vs addProseMirrorPlugins, so a command
+// mutating `this.options` does NOT reach the plugin. addProseMirrorPlugins
+// publishes its own options object here; commands mutate THIS one so the live
+// margin/size change is actually seen by the decoration build.
+const liveOptions = new WeakMap<object, PaginationPlusOptions>();
+
+// Sets the editor root's min-height to the bottom of the last page break so the
+// final page renders its full height. DOM-only, safe to call from a rAF.
+const refreshPage = (targetNode: HTMLElement) => {
+  const paginationElement = targetNode.querySelector("[data-rm-pagination]");
+  if (paginationElement) {
+    const lastPageBreak = paginationElement.lastElementChild?.querySelector(
+      ".breaker"
+    ) as HTMLElement;
+    if (lastPageBreak) {
+      const minHeight = lastPageBreak.offsetTop + lastPageBreak.offsetHeight;
+      targetNode.style.minHeight = `${minHeight}px`;
+    }
+  }
+};
+
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     PaginationPlus: {
@@ -82,7 +108,7 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
 
     const config = { attributes: true };
 
-    updateCssVariables(targetNode, this.options);
+    updateCssVariables(targetNode, liveOptions.get(this.editor) ?? this.options);
 
     const style = document.createElement("style");
     style.dataset.rmPaginationStyle = "";
@@ -204,41 +230,17 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
     `;
     document.head.appendChild(style);
 
-    const refreshPage = (targetNode: HTMLElement) => {
-      const paginationElement = targetNode.querySelector(
-        "[data-rm-pagination]"
-      );
-      if (paginationElement) {
-        const lastPageBreak = paginationElement.lastElementChild?.querySelector(
-          ".breaker"
-        ) as HTMLElement;
-        if (lastPageBreak) {
-          const minHeight =
-            lastPageBreak.offsetTop + lastPageBreak.offsetHeight;
-          targetNode.style.minHeight = `${minHeight}px`;
-        }
-      }
-    };
-
     const callback = (
       mutationList: MutationRecord[]
     ) => {
       if (mutationList.length > 0 && mutationList[0].target) {
         const _target = mutationList[0].target as HTMLElement;
         if (_target.classList.contains("rm-with-pagination")) {
-          const currentPageCount = getExistingPageCount(this.editor.view);
-          const pageCount = calculatePageCount(this.editor.view, this.options);
-          const recalculatePageCount = needNewDecoration(this.editor.view, this.options, this.storage);
-          if (currentPageCount !== pageCount || recalculatePageCount) {
-
-               const tr = this.editor.view.state.tr.setMeta(
-                 page_count_meta_key,
-                 Date.now()
-               );
-               this.editor.view.dispatch(tr);
-          }
-
-          refreshPage(_target);
+          // Reflows not driven by a doc transaction (image/font load, async
+          // resize) land here. Coalesce them into one rAF measurement instead
+          // of measuring + dispatching synchronously — the synchronous path
+          // thrashed layout and could re-enter via the plugin's own style writes.
+          schedulers.get(this.editor)?.();
         }
       }
     };
@@ -248,45 +250,107 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
   },
   addProseMirrorPlugins() {
     const editor = this.editor;
+
+    // Canonical options object. tiptap gives addCommands a DIFFERENT `this.options`
+    // than the one read here, so commands mutate `opts` (published via liveOptions)
+    // rather than their own `this.options`. The plugin and the decoration build use
+    // `opts` exclusively so a live margin/size change is actually rendered.
+    const opts = this.options;
+    liveOptions.set(editor, opts);
+    let storage: PaginationPlusOptions = { ...opts };
+
+    // Coalesce expensive pagination measurement into a single animation frame.
+    // Typing dispatches a transaction per keystroke; measuring (reflow + style
+    // writes) on each one is the layout thrash that stutters long docs. Instead
+    // we map decorations cheaply on each edit and remeasure once per frame.
+    let recalcScheduled = false;
+    // Stability gate: the page-count algorithm is delta-based and returns
+    // transient values while the layout is mid-reflow (it oscillated 1→3→4→…).
+    // We only rebuild when two consecutive frames agree on a count that differs
+    // from the DOM; a disagreeing measurement just re-arms another frame. This
+    // converges instead of forming a rebuild storm (frozen tab).
+    let lastMeasured = -1;
+    const scheduleRecalc = () => {
+      if (recalcScheduled) {
+        return;
+      }
+      recalcScheduled = true;
+      requestAnimationFrame(() => {
+        recalcScheduled = false;
+        const view = editor.view;
+        if (!view || !view.dom || !(view.dom as HTMLElement).isConnected) {
+          return;
+        }
+        const measured = calculatePageCount(view, opts);
+        const target = measured > 1 ? measured : 1;
+        const currentPageCount = getExistingPageCount(view);
+        if (target !== currentPageCount) {
+          if (target === lastMeasured) {
+            view.dispatch(view.state.tr.setMeta(page_count_meta_key, Date.now()));
+          } else {
+            lastMeasured = target;
+            scheduleRecalc();
+          }
+        } else {
+          lastMeasured = target;
+        }
+        refreshPage(view.dom as HTMLElement);
+      });
+    };
+    schedulers.set(editor, scheduleRecalc);
+
+    const optionsChangedFrom = (prev: PaginationPlusOptions) =>
+      prev.pageBreakBackground !== opts.pageBreakBackground ||
+      prev.pageHeight !== opts.pageHeight ||
+      prev.pageWidth !== opts.pageWidth ||
+      prev.marginTop !== opts.marginTop ||
+      prev.marginBottom !== opts.marginBottom ||
+      prev.marginLeft !== opts.marginLeft ||
+      prev.marginRight !== opts.marginRight ||
+      prev.pageGap !== opts.pageGap ||
+      prev.contentMarginTop !== opts.contentMarginTop ||
+      prev.contentMarginBottom !== opts.contentMarginBottom ||
+      prev.headerLeft !== opts.headerLeft ||
+      prev.headerRight !== opts.headerRight ||
+      prev.footerLeft !== opts.footerLeft ||
+      prev.footerRight !== opts.footerRight;
+
     return [
       new Plugin({
         key: new PluginKey("pagination"),
 
         state: {
           init:(_, state) => {
-            const widgetList = createDecoration(state, this.options);
-            this.storage = {...this.options};
+            const widgetList = createDecoration(state, opts);
+            storage = { ...opts };
             return DecorationSet.create(state.doc, widgetList);
           },
           apply:(tr, oldDeco, oldState, newState) => {
-            const pageCount = calculatePageCount(editor.view, this.options);
-            const currentPageCount = getExistingPageCount(editor.view);
+            const optionChanged = optionsChangedFrom(storage);
+            const forced = tr.getMeta(page_count_meta_key) != null;
 
-            const recalculatePageCount = needNewDecoration(editor.view, this.options, this.storage);
-
-            if (
-              (pageCount > 1 ? pageCount : 1) !== currentPageCount ||
-              recalculatePageCount ||
-              this.storage.pageBreakBackground !== this.options.pageBreakBackground ||
-              this.storage.pageHeight !== this.options.pageHeight ||
-              this.storage.pageWidth !== this.options.pageWidth ||
-              this.storage.marginTop !== this.options.marginTop ||
-              this.storage.marginBottom !== this.options.marginBottom ||
-              this.storage.marginLeft !== this.options.marginLeft ||
-              this.storage.marginRight !== this.options.marginRight ||
-              this.storage.pageGap !== this.options.pageGap ||
-              this.storage.contentMarginTop !== this.options.contentMarginTop ||
-              this.storage.contentMarginBottom !== this.options.contentMarginBottom ||
-              this.storage.headerLeft !== this.options.headerLeft ||
-              this.storage.headerRight !== this.options.headerRight ||
-              this.storage.footerLeft !== this.options.footerLeft ||
-              this.storage.footerRight !== this.options.footerRight
-            ) {
-              const widgetList = createDecoration(newState, this.options);
-              this.storage = {...this.options};
-              newState.tr.setMeta(page_count_meta_key, Date.now())
+            // Option change (live margins/size/header) or a forced recalc (from
+            // the rAF measurement or the MutationObserver) rebuilds the page
+            // widgets synchronously so the change is visible this frame. An
+            // option change re-measures from a CLEAN baseline (ignoring stale
+            // tiles) so the count converges; rAF-forced refinements keep the
+            // delta measurement.
+            if (optionChanged || forced) {
+              const widgetList = createDecoration(newState, opts, false, optionChanged);
+              storage = { ...opts };
+              // A rebuild resets the layout, so drop any pending stability vote.
+              lastMeasured = -1;
               return DecorationSet.create(newState.doc, [...widgetList]);
             }
+
+            // Plain doc edits never need a synchronous remeasure: map the pos-0
+            // widgets through the change and schedule one measurement per frame.
+            if (tr.docChanged) {
+              scheduleRecalc();
+              return oldDeco.map(tr.mapping, tr.doc);
+            }
+
+            // Selection-only / meta-less transactions can't change pagination.
             return oldDeco;
           },
         },
@@ -327,54 +391,56 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
     ];
   },
   addCommands() {
+    // Mutate the SAME options object the plugin reads (published in liveOptions
+    // by addProseMirrorPlugins) — NOT `this.options`, which tiptap scopes
+    // separately for commands — then dispatch a meta transaction so the plugin's
+    // `apply` rebuilds the decorations with the new options. This is what makes a
+    // margin/size change apply live, with no editor remount.
+    const apply = (
+      props: { editor?: any, tr: any, dispatch?: (tr: any) => void },
+      mutate: (o: PaginationPlusOptions) => void,
+    ) => {
+      const o = liveOptions.get((props.editor ?? this.editor) as object) ?? this.options;
+      mutate(o);
+      if (props.dispatch) {
+        props.dispatch(props.tr.setMeta(page_count_meta_key, Date.now()));
+      }
+      return true;
+    };
     return {
-      updatePageBreakBackground: (color: string) => () => {
-        this.options.pageBreakBackground = color;
-        return true;
-      },
-      updatePageSize: (size: PageSize) => () => {
-        this.options.pageHeight = size.pageHeight;
-        this.options.pageWidth = size.pageWidth;
-        this.options.marginTop = size.marginTop;
-        this.options.marginBottom = size.marginBottom;
-        this.options.marginLeft = size.marginLeft;
-        this.options.marginRight = size.marginRight;
-        return true;
-      },
-      updatePageWidth: (width: number) => () => {
-        this.options.pageWidth = width;
-        return true;
-      },
-      updatePageHeight: (height: number) => () => {
-        this.options.pageHeight = height;
-        return true;
-      },
-      updatePageGap: (gap: number) => () => {
-        this.options.pageGap = gap;
-        return true;
-      },
-      updateMargins: (margins: { top: number, bottom: number, left: number, right: number }) => () => {
-        this.options.marginTop = margins.top;
-        this.options.marginBottom = margins.bottom;
-        this.options.marginLeft = margins.left;
-        this.options.marginRight = margins.right;
-        return true;
-      },
-      updateContentMargins: (margins: { top: number, bottom: number }) => () => {
-        this.options.contentMarginTop = margins.top;
-        this.options.contentMarginBottom = margins.bottom;
-        return true;
-      },
-      updateHeaderContent: (left: string, right: string) => () => {
-        this.options.headerLeft = left;
-        this.options.headerRight = right;
-        return true;
-      },
-      updateFooterContent: (left: string, right: string) => () => {
-        this.options.footerLeft = left;
-        this.options.footerRight = right;
-        return true;
-      },
+      updatePageBreakBackground: (color: string) => (props) =>
+        apply(props, (o) => { o.pageBreakBackground = color; }),
+      updatePageSize: (size: PageSize) => (props) =>
+        apply(props, (o) => {
+          o.pageHeight = size.pageHeight;
+          o.pageWidth = size.pageWidth;
+          o.marginTop = size.marginTop;
+          o.marginBottom = size.marginBottom;
+          o.marginLeft = size.marginLeft;
+          o.marginRight = size.marginRight;
+        }),
+      updatePageWidth: (width: number) => (props) =>
+        apply(props, (o) => { o.pageWidth = width; }),
+      updatePageHeight: (height: number) => (props) =>
+        apply(props, (o) => { o.pageHeight = height; }),
+      updatePageGap: (gap: number) => (props) =>
+        apply(props, (o) => { o.pageGap = gap; }),
+      updateMargins: (margins: { top: number, bottom: number, left: number, right: number }) => (props) =>
+        apply(props, (o) => {
+          o.marginTop = margins.top;
+          o.marginBottom = margins.bottom;
+          o.marginLeft = margins.left;
+          o.marginRight = margins.right;
+        }),
+      updateContentMargins: (margins: { top: number, bottom: number }) => (props) =>
+        apply(props, (o) => {
+          o.contentMarginTop = margins.top;
+          o.contentMarginBottom = margins.bottom;
+        }),
+      updateHeaderContent: (left: string, right: string) => (props) =>
+        apply(props, (o) => { o.headerLeft = left; o.headerRight = right; }),
+      updateFooterContent: (left: string, right: string) => (props) =>
+        apply(props, (o) => { o.footerLeft = left; o.footerRight = right; }),
     };
   },
 });
@@ -414,7 +480,10 @@ const needNewDecoration = (view: EditorView, pageOptions: PaginationPlusOptions,
       const _pageFooterHeight = pageOptions.contentMarginBottom + pageOptions.marginBottom + footerHeight;
       const _pageHeight = pageOptions.pageHeight - _pageHeaderHeight - _pageFooterHeight;
 
-      if(marginTop !== _pageHeight + _pageHeaderHeight) {
+      // Tolerate sub-pixel / line-box rounding. An exact `!==` here can stay
+      // perpetually true after an in-place option change (e.g. live margins),
+      // which makes the MutationObserver dispatch on every tick and freeze the tab.
+      if (Math.abs(marginTop - (_pageHeight + _pageHeaderHeight)) > 1) {
         recalculatePageCount = true;
       }
 
@@ -425,7 +494,8 @@ const needNewDecoration = (view: EditorView, pageOptions: PaginationPlusOptions,
 }
 const calculatePageCount = (
   view: EditorView,
-  pageOptions: PaginationPlusOptions
+  pageOptions: PaginationPlusOptions,
+  clean: boolean = false,
 ) => {
   const editorDom = view.dom;
   updateCssVariables(editorDom, pageOptions);
@@ -438,9 +508,38 @@ const calculatePageCount = (
   const pageContentAreaHeight =
     pageOptions.pageHeight - _pageHeaderHeight - _pageFooterHeight;
 
+  // Guard the divisor: if margins/header/footer ever sum to >= page height the
+  // content area is <= 0, and dividing a gap by it yields Infinity/negative —
+  // which then drives an unbounded page-tile render loop (frozen tab). Floor it.
+  const safeArea = pageContentAreaHeight > 1 ? pageContentAreaHeight : 1;
 
-  const paginationElement = editorDom.querySelector("[data-rm-pagination]");
+  const paginationElement = editorDom.querySelector("[data-rm-pagination]") as HTMLElement | null;
   const currentPageCount = getExistingPageCount(view);
+
+  // Clean baseline (used on an in-place option change, e.g. live margins). The
+  // delta branch below grows `currentPageCount + addPage`; in place the existing
+  // page tiles + the root's tile-derived min-height inflate every measurement,
+  // so it never converges (runaway → frozen tab). Hiding the tiles and dropping
+  // min-height reproduces the FRESH-MOUNT measurement (content height ÷ page
+  // area) — the exact basis that already paginates tables/images correctly on
+  // load. The subsequent delta passes then refine overflow from a correct base.
+  if (clean) {
+    const prevDisplay = paginationElement ? paginationElement.style.display : "";
+    const prevMinHeight = editorDom.style.minHeight;
+    if (paginationElement) {
+      paginationElement.style.display = "none";
+    }
+    editorDom.style.minHeight = "0px";
+    const contentHeight = editorDom.scrollHeight;
+    editorDom.style.minHeight = prevMinHeight;
+    if (paginationElement) {
+      paginationElement.style.display = prevDisplay;
+    }
+    const cleanCount = Math.ceil(contentHeight / safeArea);
+    return Number.isFinite(cleanCount) && cleanCount >= 1 ? Math.min(cleanCount, 5000) : 1;
+  }
+
+  let result = 1;
   if (paginationElement) {
     const lastElementOfEditor = editorDom.lastElementChild;
     const lastPageBreak =
@@ -452,30 +551,36 @@ const calculatePageCount = (
         lastElementRect.bottom -
         lastPageBreakRect.bottom;
       if (lastPageGap > 0) {
-        const addPage = Math.ceil(lastPageGap / pageContentAreaHeight);
-        return currentPageCount + addPage;
+        const addPage = Math.ceil(lastPageGap / safeArea);
+        result = currentPageCount + addPage;
       } else {
         const lpFrom = -10;
         const lpTo = -(pageOptions.pageHeight - 10);
         if (lastPageGap > lpTo && lastPageGap < lpFrom) {
-          return currentPageCount;
+          result = currentPageCount;
         } else if (lastPageGap < lpTo) {
           const pageHeightOnRemove =
             pageOptions.pageHeight + pageOptions.pageGap;
           const removePage = Math.floor(lastPageGap / pageHeightOnRemove);
-          return currentPageCount + removePage;
+          result = currentPageCount + removePage;
         } else {
-          return currentPageCount;
+          result = currentPageCount;
         }
       }
+    } else {
+      result = 1;
     }
-    return 1;
   } else {
     const editorHeight = editorDom.scrollHeight;
-    let pageCount = Math.ceil(editorHeight / pageContentAreaHeight);
-    pageCount = pageCount <= 0 ? 1 : pageCount;
-    return pageCount;
+    result = Math.ceil(editorHeight / safeArea);
   }
+
+  // Final safety net: never return a non-finite or absurd page count (which
+  // would drive an unbounded tile-render loop).
+  if (!Number.isFinite(result) || result > 5000) {
+    result = currentPageCount > 0 ? currentPageCount : 1;
+  }
+  return result < 1 ? 1 : result;
 };
 
 function applyPageToken(template: string, enabled: boolean, klass: string) {
@@ -513,7 +618,8 @@ function getFooter(footerRightContent: string, footerLeftContent: string,
 function createDecoration(
   state: EditorState,
   pageOptions: PaginationPlusOptions,
-  isInitial: boolean = false
+  isInitial: boolean = false,
+  clean: boolean = false
 ): Decoration[] {
   const pageWidget = Decoration.widget(
     0,
@@ -611,7 +717,8 @@ function createDecoration(
       });
       const fragment = document.createDocumentFragment();
 
-      const pageCount = calculatePageCount(view, pageOptions);
+      const rawCount = calculatePageCount(view, pageOptions, clean);
+      const pageCount = Number.isFinite(rawCount) ? Math.max(1, Math.min(rawCount, 1000)) : 1;
 
       for (let i = 0; i < pageCount; i++) {
         if (i === 0) {
