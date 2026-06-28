@@ -70,7 +70,9 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
     return defaultOptions;
   },
   addStorage() {
-    return defaultOptions;
+    // Live, command-mutable config. Fresh per-editor copy — never the shared
+    // module object, or two editors would mutate each other's config.
+    return { ...defaultOptions };
   },
   onCreate() {
     const targetNode = this.editor.view.dom;
@@ -82,7 +84,7 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
 
     const config = { attributes: true };
 
-    updateCssVariables(targetNode, this.options);
+    updateCssVariables(targetNode, this.storage);
 
     const style = document.createElement("style");
     style.dataset.rmPaginationStyle = "";
@@ -227,8 +229,8 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
         const _target = mutationList[0].target as HTMLElement;
         if (_target.classList.contains("rm-with-pagination")) {
           const currentPageCount = getExistingPageCount(this.editor.view);
-          const pageCount = calculatePageCount(this.editor.view, this.options);
-          const recalculatePageCount = needNewDecoration(this.editor.view, this.options, this.storage);
+          const pageCount = calculatePageCount(this.editor.view, this.storage);
+          const recalculatePageCount = needNewDecoration(this.editor.view, this.storage, this.storage);
           if (currentPageCount !== pageCount || recalculatePageCount) {
 
                const tr = this.editor.view.state.tr.setMeta(
@@ -248,42 +250,51 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
   },
   addProseMirrorPlugins() {
     const editor = this.editor;
+    // Snapshot of the config last rendered into decorations. apply() diffs the
+    // live config (this.storage) against this to decide whether to rebuild.
+    let applied: PaginationPlusOptions = { ...this.storage };
     return [
       new Plugin({
         key: new PluginKey("pagination"),
 
         state: {
           init:(_, state) => {
-            const widgetList = createDecoration(state, this.options);
-            this.storage = {...this.options};
+            // Seed the live config (this.storage) from the configured options
+            // once. Commands mutate this.storage thereafter — NOT this.options,
+            // which tiptap scopes separately for commands so a mutation there
+            // never reaches this plugin. this.storage IS shared across contexts.
+            Object.assign(this.storage, this.options);
+            const widgetList = createDecoration(state, this.storage);
+            applied = {...this.storage};
             return DecorationSet.create(state.doc, widgetList);
           },
           apply:(tr, oldDeco, oldState, newState) => {
-            const pageCount = calculatePageCount(editor.view, this.options);
+            const opts = this.storage;
+            const pageCount = calculatePageCount(editor.view, opts);
             const currentPageCount = getExistingPageCount(editor.view);
 
-            const recalculatePageCount = needNewDecoration(editor.view, this.options, this.storage);
+            const recalculatePageCount = needNewDecoration(editor.view, opts, applied);
 
             if (
               (pageCount > 1 ? pageCount : 1) !== currentPageCount ||
               recalculatePageCount ||
-              this.storage.pageBreakBackground !== this.options.pageBreakBackground ||
-              this.storage.pageHeight !== this.options.pageHeight ||
-              this.storage.pageWidth !== this.options.pageWidth ||
-              this.storage.marginTop !== this.options.marginTop ||
-              this.storage.marginBottom !== this.options.marginBottom ||
-              this.storage.marginLeft !== this.options.marginLeft ||
-              this.storage.marginRight !== this.options.marginRight ||
-              this.storage.pageGap !== this.options.pageGap ||
-              this.storage.contentMarginTop !== this.options.contentMarginTop ||
-              this.storage.contentMarginBottom !== this.options.contentMarginBottom ||
-              this.storage.headerLeft !== this.options.headerLeft ||
-              this.storage.headerRight !== this.options.headerRight ||
-              this.storage.footerLeft !== this.options.footerLeft ||
-              this.storage.footerRight !== this.options.footerRight
+              applied.pageBreakBackground !== opts.pageBreakBackground ||
+              applied.pageHeight !== opts.pageHeight ||
+              applied.pageWidth !== opts.pageWidth ||
+              applied.marginTop !== opts.marginTop ||
+              applied.marginBottom !== opts.marginBottom ||
+              applied.marginLeft !== opts.marginLeft ||
+              applied.marginRight !== opts.marginRight ||
+              applied.pageGap !== opts.pageGap ||
+              applied.contentMarginTop !== opts.contentMarginTop ||
+              applied.contentMarginBottom !== opts.contentMarginBottom ||
+              applied.headerLeft !== opts.headerLeft ||
+              applied.headerRight !== opts.headerRight ||
+              applied.footerLeft !== opts.footerLeft ||
+              applied.footerRight !== opts.footerRight
             ) {
-              const widgetList = createDecoration(newState, this.options);
-              this.storage = {...this.options};
+              const widgetList = createDecoration(newState, opts);
+              applied = {...opts};
               newState.tr.setMeta(page_count_meta_key, Date.now())
               return DecorationSet.create(newState.doc, [...widgetList]);
             }
@@ -329,50 +340,50 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
   addCommands() {
     return {
       updatePageBreakBackground: (color: string) => () => {
-        this.options.pageBreakBackground = color;
+        this.storage.pageBreakBackground = color;
         return true;
       },
       updatePageSize: (size: PageSize) => () => {
-        this.options.pageHeight = size.pageHeight;
-        this.options.pageWidth = size.pageWidth;
-        this.options.marginTop = size.marginTop;
-        this.options.marginBottom = size.marginBottom;
-        this.options.marginLeft = size.marginLeft;
-        this.options.marginRight = size.marginRight;
+        this.storage.pageHeight = size.pageHeight;
+        this.storage.pageWidth = size.pageWidth;
+        this.storage.marginTop = size.marginTop;
+        this.storage.marginBottom = size.marginBottom;
+        this.storage.marginLeft = size.marginLeft;
+        this.storage.marginRight = size.marginRight;
         return true;
       },
       updatePageWidth: (width: number) => () => {
-        this.options.pageWidth = width;
+        this.storage.pageWidth = width;
         return true;
       },
       updatePageHeight: (height: number) => () => {
-        this.options.pageHeight = height;
+        this.storage.pageHeight = height;
         return true;
       },
       updatePageGap: (gap: number) => () => {
-        this.options.pageGap = gap;
+        this.storage.pageGap = gap;
         return true;
       },
       updateMargins: (margins: { top: number, bottom: number, left: number, right: number }) => () => {
-        this.options.marginTop = margins.top;
-        this.options.marginBottom = margins.bottom;
-        this.options.marginLeft = margins.left;
-        this.options.marginRight = margins.right;
+        this.storage.marginTop = margins.top;
+        this.storage.marginBottom = margins.bottom;
+        this.storage.marginLeft = margins.left;
+        this.storage.marginRight = margins.right;
         return true;
       },
       updateContentMargins: (margins: { top: number, bottom: number }) => () => {
-        this.options.contentMarginTop = margins.top;
-        this.options.contentMarginBottom = margins.bottom;
+        this.storage.contentMarginTop = margins.top;
+        this.storage.contentMarginBottom = margins.bottom;
         return true;
       },
       updateHeaderContent: (left: string, right: string) => () => {
-        this.options.headerLeft = left;
-        this.options.headerRight = right;
+        this.storage.headerLeft = left;
+        this.storage.headerRight = right;
         return true;
       },
       updateFooterContent: (left: string, right: string) => () => {
-        this.options.footerLeft = left;
-        this.options.footerRight = right;
+        this.storage.footerLeft = left;
+        this.storage.footerRight = right;
         return true;
       },
     };
