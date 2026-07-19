@@ -222,6 +222,10 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
       }
     };
 
+    // Re-dispatch rate guard: if pagination keeps disagreeing with the DOM
+    // (divergent geometry), stop feeding the observer→dispatch cycle instead
+    // of livelocking the tab. Recovers on the next natural mutation.
+    let dispatchTimes: number[] = [];
     const callback = (
       mutationList: MutationRecord[]
     ) => {
@@ -232,12 +236,23 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
           const pageCount = calculatePageCount(this.editor.view, this.storage);
           const recalculatePageCount = needNewDecoration(this.editor.view, this.storage, this.storage);
           if (currentPageCount !== pageCount || recalculatePageCount) {
-
-               const tr = this.editor.view.state.tr.setMeta(
-                 page_count_meta_key,
-                 Date.now()
-               );
-               this.editor.view.dispatch(tr);
+            const now = Date.now();
+            dispatchTimes = dispatchTimes.filter((t) => now - t < 2000);
+            dispatchTimes.push(now);
+            if (dispatchTimes.length > 30) {
+              if (dispatchTimes.length === 31) {
+                console.warn("[PaginationPlus] page-count did not converge; pausing repagination", {
+                  currentPageCount,
+                  pageCount,
+                });
+              }
+            } else {
+              const tr = this.editor.view.state.tr.setMeta(
+                page_count_meta_key,
+                Date.now()
+              );
+              this.editor.view.dispatch(tr);
+            }
           }
 
           refreshPage(_target);
@@ -453,32 +468,40 @@ const calculatePageCount = (
   const paginationElement = editorDom.querySelector("[data-rm-pagination]");
   const currentPageCount = getExistingPageCount(view);
   if (paginationElement) {
-    const lastElementOfEditor = editorDom.lastElementChild;
+    // Skip trailing out-of-flow elements (overlays, absolutely positioned
+    // layers): they don't participate in pagination flow.
+    let lastElementOfEditor = editorDom.lastElementChild;
+    while (
+      lastElementOfEditor &&
+      (lastElementOfEditor.getAttribute("data-type") === "block-layer" ||
+        ["absolute", "fixed"].indexOf(getComputedStyle(lastElementOfEditor).position) !== -1)
+    ) {
+      lastElementOfEditor = lastElementOfEditor.previousElementSibling;
+    }
     const lastPageBreak =
     paginationElement.lastElementChild?.querySelector(".breaker");
     if (lastElementOfEditor && lastPageBreak) {
       const lastElementRect = lastElementOfEditor.getBoundingClientRect();
       const lastPageBreakRect = lastPageBreak.getBoundingClientRect();
+      // Mid-rebuild DOM (detached/unpainted widgets) measures as 0-rects;
+      // recomputing from garbage explodes the page count. Keep the current one.
+      if (lastPageBreakRect.height === 0 && lastPageBreakRect.bottom === 0) {
+        return currentPageCount;
+      }
       const lastPageGap =
         lastElementRect.bottom -
         lastPageBreakRect.bottom;
+      // One full page cycle (breaker-bottom to breaker-bottom). Add/remove must
+      // both use it, with remove only past a full empty cycle — otherwise the
+      // count overshoots, lands past the opposite threshold and ping-pongs
+      // add⇄remove forever (page-count livelock that freezes the tab).
+      const pageCycle = pageOptions.pageHeight + pageOptions.pageGap;
       if (lastPageGap > 0) {
-        const addPage = Math.ceil(lastPageGap / pageContentAreaHeight);
+        const addPage = Math.ceil(lastPageGap / pageCycle);
         return currentPageCount + addPage;
-      } else {
-        const lpFrom = -10;
-        const lpTo = -(pageOptions.pageHeight - 10);
-        if (lastPageGap > lpTo && lastPageGap < lpFrom) {
-          return currentPageCount;
-        } else if (lastPageGap < lpTo) {
-          const pageHeightOnRemove =
-            pageOptions.pageHeight + pageOptions.pageGap;
-          const removePage = Math.floor(lastPageGap / pageHeightOnRemove);
-          return currentPageCount + removePage;
-        } else {
-          return currentPageCount;
-        }
       }
+      const removePage = Math.floor(-lastPageGap / pageCycle);
+      return Math.max(1, currentPageCount - removePage);
     }
     return 1;
   } else {
