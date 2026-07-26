@@ -224,7 +224,11 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
         if (lastPageBreak) {
           const minHeight =
             lastPageBreak.offsetTop + lastPageBreak.offsetHeight;
-          targetNode.style.minHeight = `${minHeight}px`;
+          // Skip no-op writes: this node is the one the MutationObserver watches.
+          const next = `${minHeight}px`;
+          if (targetNode.style.minHeight !== next) {
+            targetNode.style.minHeight = next;
+          }
         }
       }
     };
@@ -263,6 +267,9 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
           }
 
           refreshPage(_target);
+          // updateCssVariables/refreshPage write style on the observed node, so
+          // every pass re-arms this callback. Drop the records we just caused.
+          this.storage.observer?.takeRecords();
         }
       }
     };
