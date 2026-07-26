@@ -23,6 +23,12 @@ export interface PaginationPlusOptions {
   pageGapBorderColor: string;
   showPageNumber: boolean;
 }
+
+/** Live config plus the per-editor handles onDestroy has to release. */
+export interface PaginationPlusStorage extends PaginationPlusOptions {
+  styleEl?: HTMLStyleElement;
+  observer?: MutationObserver;
+}
 const page_count_meta_key = "PAGE_COUNT_META_KEY";
 
 declare module "@tiptap/core" {
@@ -40,7 +46,7 @@ declare module "@tiptap/core" {
     };
   }
   interface Storage {
-    PaginationPlus: PaginationPlusOptions
+    PaginationPlus: PaginationPlusStorage
   }
 }
 
@@ -64,7 +70,7 @@ const defaultOptions: PaginationPlusOptions = {
   showPageNumber: false,
 }
 
-export const PaginationPlus = Extension.create<PaginationPlusOptions>({
+export const PaginationPlus = Extension.create<PaginationPlusOptions, PaginationPlusStorage>({
   name: "PaginationPlus",
   addOptions() {
     return defaultOptions;
@@ -205,6 +211,7 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
     .rm-with-pagination .rm-merge-surface { pointer-events: none; }
     `;
     document.head.appendChild(style);
+    this.storage.styleEl = style;
 
     const refreshPage = (targetNode: HTMLElement) => {
       const paginationElement = targetNode.querySelector(
@@ -261,7 +268,16 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
     };
     const observer = new MutationObserver(callback);
     observer.observe(targetNode, config);
+    this.storage.observer = observer;
     refreshPage(targetNode);
+  },
+  onDestroy() {
+    // Without this the observer keeps the editor view (and its whole doc) alive
+    // after destroy(), and every editor leaks another <style> into <head>.
+    this.storage.observer?.disconnect();
+    this.storage.observer = undefined;
+    this.storage.styleEl?.remove();
+    this.storage.styleEl = undefined;
   },
   addProseMirrorPlugins() {
     const editor = this.editor;
