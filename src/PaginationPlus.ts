@@ -470,9 +470,7 @@ const calculatePageCount = (
   pageOptions: PaginationPlusOptions
 ) => {
   const editorDom = view.dom;
-  updateCssVariables(editorDom, pageOptions);
-  const headerHeight = editorDom.querySelector(".rm-first-page-header")?.clientHeight || 0;
-  const footerHeight = editorDom.querySelector(".rm-page-footer")?.clientHeight || 0;
+  const { headerHeight, footerHeight } = updateCssVariables(editorDom, pageOptions);
 
   const _pageHeaderHeight = pageOptions.contentMarginTop + pageOptions.marginTop + headerHeight;
   const _pageFooterHeight = pageOptions.contentMarginBottom + pageOptions.marginBottom + footerHeight;

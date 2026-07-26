@@ -1,6 +1,7 @@
 import { PaginationPlusOptions } from "./PaginationPlus";
 import { PageSize } from "./constants";
 
+/** Returns the measured header/footer heights so callers need not re-read them. */
 export const updateCssVariables = (targetNode: HTMLElement, config: PaginationPlusOptions) => {
 
   const headerHeight = targetNode.querySelector(".rm-first-page-header")?.clientHeight || 0;
@@ -24,9 +25,17 @@ export const updateCssVariables = (targetNode: HTMLElement, config: PaginationPl
         "rm-page-width": `${config.pageWidth}px`,
       }
 
+  // These are inherited custom properties, so every write invalidates style for
+  // the whole editor subtree and the next layout read pays for it. Reading the
+  // inline declaration back is layout-free, so skip writes that change nothing.
   Object.entries(cssVariables).forEach(([key, value]) => {
-    targetNode.style.setProperty(`--${key}`, value);
+    const property = `--${key}`;
+    if (targetNode.style.getPropertyValue(property) !== value) {
+      targetNode.style.setProperty(property, value);
+    }
   });
+
+  return { headerHeight, footerHeight };
 }
 
 export const getPageSize = (height: number, width: number, marginTop: number, marginBottom: number, marginLeft: number, marginRight: number): PageSize => {
