@@ -28,6 +28,8 @@ export interface PaginationPlusOptions {
 export interface PaginationPlusStorage extends PaginationPlusOptions {
   styleEl?: HTMLStyleElement;
   observer?: MutationObserver;
+  scheduleCheck?: () => void;
+  cancelCheck?: () => void;
 }
 const page_count_meta_key = "PAGE_COUNT_META_KEY";
 
@@ -237,39 +239,60 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     // (divergent geometry), stop feeding the observer→dispatch cycle instead
     // of livelocking the tab. Recovers on the next natural mutation.
     let dispatchTimes: number[] = [];
+    const perform = () => {
+      if (this.editor.isDestroyed) { return; }
+      const view = this.editor.view;
+      const currentPageCount = getExistingPageCount(view);
+      const pageCount = calculatePageCount(view, this.storage);
+      const recalculatePageCount = needNewDecoration(view, this.storage, this.storage);
+      if (currentPageCount !== pageCount || recalculatePageCount) {
+        const now = Date.now();
+        dispatchTimes = dispatchTimes.filter((t) => now - t < 2000);
+        dispatchTimes.push(now);
+        if (dispatchTimes.length > 30) {
+          if (dispatchTimes.length === 31) {
+            console.warn("[PaginationPlus] page-count did not converge; pausing repagination", {
+              currentPageCount,
+              pageCount,
+            });
+          }
+        } else {
+          const tr = view.state.tr.setMeta(page_count_meta_key, Date.now());
+          view.dispatch(tr);
+          // Re-arm once so convergence is verified after the rebuild redraws.
+          scheduleCheck();
+        }
+      }
+      refreshPage(targetNode);
+      // perform() writes style on the observed node; drop the records it caused.
+      this.storage.observer?.takeRecords();
+    };
+    // Debounce: coalesce keystroke bursts into one post-redraw geometry read.
+    let trailingTimer: number | undefined;
+    let maxWaitTimer: number | undefined;
+    const clearTimers = () => {
+      if (trailingTimer !== undefined) { clearTimeout(trailingTimer); trailingTimer = undefined; }
+      if (maxWaitTimer !== undefined) { clearTimeout(maxWaitTimer); maxWaitTimer = undefined; }
+    };
+    const runNow = () => {
+      clearTimers();
+      perform();
+    };
+    const scheduleCheck = () => {
+      if (trailingTimer !== undefined) { clearTimeout(trailingTimer); }
+      trailingTimer = window.setTimeout(runNow, 150);
+      // maxWait so continuous typing still paginates.
+      if (maxWaitTimer === undefined) { maxWaitTimer = window.setTimeout(runNow, 600); }
+    };
+    this.storage.scheduleCheck = scheduleCheck;
+    this.storage.cancelCheck = clearTimers;
     const callback = (
       mutationList: MutationRecord[]
     ) => {
       if (mutationList.length > 0 && mutationList[0].target) {
         const _target = mutationList[0].target as HTMLElement;
         if (_target.classList.contains("rm-with-pagination")) {
-          const currentPageCount = getExistingPageCount(this.editor.view);
-          const pageCount = calculatePageCount(this.editor.view, this.storage);
-          const recalculatePageCount = needNewDecoration(this.editor.view, this.storage, this.storage);
-          if (currentPageCount !== pageCount || recalculatePageCount) {
-            const now = Date.now();
-            dispatchTimes = dispatchTimes.filter((t) => now - t < 2000);
-            dispatchTimes.push(now);
-            if (dispatchTimes.length > 30) {
-              if (dispatchTimes.length === 31) {
-                console.warn("[PaginationPlus] page-count did not converge; pausing repagination", {
-                  currentPageCount,
-                  pageCount,
-                });
-              }
-            } else {
-              const tr = this.editor.view.state.tr.setMeta(
-                page_count_meta_key,
-                Date.now()
-              );
-              this.editor.view.dispatch(tr);
-            }
-          }
-
-          refreshPage(_target);
-          // updateCssVariables/refreshPage write style on the observed node, so
-          // every pass re-arms this callback. Drop the records we just caused.
-          this.storage.observer?.takeRecords();
+          scheduleCheck();
         }
       }
     };
@@ -277,17 +300,20 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     observer.observe(targetNode, config);
     this.storage.observer = observer;
     refreshPage(targetNode);
+    scheduleCheck();
   },
   onDestroy() {
     // Without this the observer keeps the editor view (and its whole doc) alive
     // after destroy(), and every editor leaks another <style> into <head>.
+    this.storage.cancelCheck?.();
+    this.storage.scheduleCheck = undefined;
+    this.storage.cancelCheck = undefined;
     this.storage.observer?.disconnect();
     this.storage.observer = undefined;
     this.storage.styleEl?.remove();
     this.storage.styleEl = undefined;
   },
   addProseMirrorPlugins() {
-    const editor = this.editor;
     // Snapshot of the config last rendered into decorations. apply() diffs the
     // live config (this.storage) against this to decide whether to rebuild.
     let applied: PaginationPlusOptions = { ...this.storage };
@@ -308,14 +334,10 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
           },
           apply:(tr, oldDeco, oldState, newState) => {
             const opts = this.storage;
-            const pageCount = calculatePageCount(editor.view, opts);
-            const currentPageCount = getExistingPageCount(editor.view);
-
-            const recalculatePageCount = needNewDecoration(editor.view, opts, applied);
-
+            // Geometry moved to the debounced view-layer check; rebuild only on
+            // its meta tr or a config change.
             if (
-              (pageCount > 1 ? pageCount : 1) !== currentPageCount ||
-              recalculatePageCount ||
+              tr.getMeta(page_count_meta_key) !== undefined ||
               applied.pageBreakBackground !== opts.pageBreakBackground ||
               applied.pageHeight !== opts.pageHeight ||
               applied.pageWidth !== opts.pageWidth ||
@@ -333,7 +355,6 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
             ) {
               const widgetList = createDecoration(newState, opts);
               applied = {...opts};
-              newState.tr.setMeta(page_count_meta_key, Date.now())
               return DecorationSet.create(newState.doc, [...widgetList]);
             }
             return oldDeco;
@@ -345,31 +366,28 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
             return this.getState(state) as DecorationSet;
           },
         },
+
+        view: () => ({
+          update: (view, prevState) => {
+            // Selection-only transactions keep the same doc object.
+            if (view.state.doc !== prevState.doc) {
+              this.storage.scheduleCheck?.();
+            }
+          },
+        }),
       }),
       new Plugin({
         key: new PluginKey('brDecoration'),
         state: {
-          init() { return DecorationSet.empty },
+          init(_, state) { return buildBrDecorations(state.doc); },
           apply(tr, old) {
-            // Map decorations through document changes
-            return old.map(tr.mapping, tr.doc);
+            // Positions only change when the doc does; otherwise reuse the set.
+            return tr.docChanged ? buildBrDecorations(tr.doc) : old;
           }
         },
         props: {
           decorations(state) {
-            const decorations: Decoration[] = [];
-            state.doc.descendants((node, pos) => {
-              if (node.type.name === 'hardBreak') {
-                const afterPos = pos + 1;
-                const widget = Decoration.widget(afterPos, () => {
-                  const el = document.createElement('span');
-                  el.classList.add('rm-br-decoration');
-                  return el;
-                });
-                decorations.push(widget);
-              }
-            });
-            return DecorationSet.create(state.doc, decorations);
+            return (this as Plugin).getState(state) as DecorationSet;
           }
         }
       }),
@@ -428,6 +446,19 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
   },
 });
 
+const buildBrDecorations = (doc: EditorState["doc"]): DecorationSet => {
+  const decorations: Decoration[] = [];
+  doc.descendants((node, pos) => {
+    if (node.type.name === "hardBreak") {
+      decorations.push(Decoration.widget(pos + 1, () => {
+        const el = document.createElement("span");
+        el.classList.add("rm-br-decoration");
+        return el;
+      }));
+    }
+  });
+  return DecorationSet.create(doc, decorations);
+};
 const getExistingPageCount = (view: EditorView) => {
   const editorDom = view.dom;
   const paginationElement = editorDom.querySelector("[data-rm-pagination]");
