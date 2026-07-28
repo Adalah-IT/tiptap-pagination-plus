@@ -23,7 +23,23 @@ export interface PaginationPlusOptions {
   pageGapBorderColor: string;
   showPageNumber: boolean;
 }
+
+/** Live config plus the per-editor handles onDestroy has to release. */
+export interface PaginationPlusStorage extends PaginationPlusOptions {
+  styleEl?: HTMLStyleElement;
+  observer?: MutationObserver;
+  scheduleCheck?: () => void;
+  cancelCheck?: () => void;
+}
 const page_count_meta_key = "PAGE_COUNT_META_KEY";
+
+/** Tuning for the debounced page-count check. Raise to trade latency for less work. */
+export const PAGINATION_CHECK_TIMING = {
+  /** Idle time after the last change before measuring. */
+  debounceMs: 100,
+  /** Hard ceiling so continuous typing still repaginates. */
+  maxWaitMs: 400,
+};
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -40,7 +56,7 @@ declare module "@tiptap/core" {
     };
   }
   interface Storage {
-    PaginationPlus: PaginationPlusOptions
+    PaginationPlus: PaginationPlusStorage
   }
 }
 
@@ -64,7 +80,7 @@ const defaultOptions: PaginationPlusOptions = {
   showPageNumber: false,
 }
 
-export const PaginationPlus = Extension.create<PaginationPlusOptions>({
+export const PaginationPlus = Extension.create<PaginationPlusOptions, PaginationPlusStorage>({
   name: "PaginationPlus",
   addOptions() {
     return defaultOptions;
@@ -205,6 +221,7 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
     .rm-with-pagination .rm-merge-surface { pointer-events: none; }
     `;
     document.head.appendChild(style);
+    this.storage.styleEl = style;
 
     const refreshPage = (targetNode: HTMLElement) => {
       const paginationElement = targetNode.querySelector(
@@ -217,39 +234,95 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
         if (lastPageBreak) {
           const minHeight =
             lastPageBreak.offsetTop + lastPageBreak.offsetHeight;
-          targetNode.style.minHeight = `${minHeight}px`;
+          // Skip no-op writes: this node is the one the MutationObserver watches.
+          const next = `${minHeight}px`;
+          if (targetNode.style.minHeight !== next) {
+            targetNode.style.minHeight = next;
+          }
         }
       }
     };
 
+    // Re-dispatch rate guard: if pagination keeps disagreeing with the DOM
+    // (divergent geometry), stop feeding the observer→dispatch cycle instead
+    // of livelocking the tab. Recovers on the next natural mutation.
+    let dispatchTimes: number[] = [];
+    const perform = () => {
+      if (this.editor.isDestroyed) { return; }
+      const view = this.editor.view;
+      const currentPageCount = getExistingPageCount(view);
+      const pageCount = calculatePageCount(view, this.storage);
+      const recalculatePageCount = needNewDecoration(view, this.storage, this.storage);
+      if (currentPageCount !== pageCount || recalculatePageCount) {
+        const now = Date.now();
+        dispatchTimes = dispatchTimes.filter((t) => now - t < 2000);
+        dispatchTimes.push(now);
+        if (dispatchTimes.length > 30) {
+          if (dispatchTimes.length === 31) {
+            console.warn("[PaginationPlus] page-count did not converge; pausing repagination", {
+              currentPageCount,
+              pageCount,
+            });
+          }
+        } else {
+          const tr = view.state.tr.setMeta(page_count_meta_key, Date.now());
+          view.dispatch(tr);
+          // Re-arm once so convergence is verified after the rebuild redraws.
+          scheduleCheck();
+        }
+      }
+      refreshPage(targetNode);
+      // perform() writes style on the observed node; drop the records it caused.
+      this.storage.observer?.takeRecords();
+    };
+    // Debounce: coalesce keystroke bursts into one post-redraw geometry read.
+    let trailingTimer: number | undefined;
+    let maxWaitTimer: number | undefined;
+    const clearTimers = () => {
+      if (trailingTimer !== undefined) { clearTimeout(trailingTimer); trailingTimer = undefined; }
+      if (maxWaitTimer !== undefined) { clearTimeout(maxWaitTimer); maxWaitTimer = undefined; }
+    };
+    const runNow = () => {
+      clearTimers();
+      perform();
+    };
+    const scheduleCheck = () => {
+      if (trailingTimer !== undefined) { clearTimeout(trailingTimer); }
+      trailingTimer = window.setTimeout(runNow, PAGINATION_CHECK_TIMING.debounceMs);
+      if (maxWaitTimer === undefined) {
+        maxWaitTimer = window.setTimeout(runNow, PAGINATION_CHECK_TIMING.maxWaitMs);
+      }
+    };
+    this.storage.scheduleCheck = scheduleCheck;
+    this.storage.cancelCheck = clearTimers;
     const callback = (
       mutationList: MutationRecord[]
     ) => {
       if (mutationList.length > 0 && mutationList[0].target) {
         const _target = mutationList[0].target as HTMLElement;
         if (_target.classList.contains("rm-with-pagination")) {
-          const currentPageCount = getExistingPageCount(this.editor.view);
-          const pageCount = calculatePageCount(this.editor.view, this.storage);
-          const recalculatePageCount = needNewDecoration(this.editor.view, this.storage, this.storage);
-          if (currentPageCount !== pageCount || recalculatePageCount) {
-
-               const tr = this.editor.view.state.tr.setMeta(
-                 page_count_meta_key,
-                 Date.now()
-               );
-               this.editor.view.dispatch(tr);
-          }
-
-          refreshPage(_target);
+          scheduleCheck();
         }
       }
     };
     const observer = new MutationObserver(callback);
     observer.observe(targetNode, config);
+    this.storage.observer = observer;
     refreshPage(targetNode);
+    scheduleCheck();
+  },
+  onDestroy() {
+    // Without this the observer keeps the editor view (and its whole doc) alive
+    // after destroy(), and every editor leaks another <style> into <head>.
+    this.storage.cancelCheck?.();
+    this.storage.scheduleCheck = undefined;
+    this.storage.cancelCheck = undefined;
+    this.storage.observer?.disconnect();
+    this.storage.observer = undefined;
+    this.storage.styleEl?.remove();
+    this.storage.styleEl = undefined;
   },
   addProseMirrorPlugins() {
-    const editor = this.editor;
     // Snapshot of the config last rendered into decorations. apply() diffs the
     // live config (this.storage) against this to decide whether to rebuild.
     let applied: PaginationPlusOptions = { ...this.storage };
@@ -270,14 +343,10 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
           },
           apply:(tr, oldDeco, oldState, newState) => {
             const opts = this.storage;
-            const pageCount = calculatePageCount(editor.view, opts);
-            const currentPageCount = getExistingPageCount(editor.view);
-
-            const recalculatePageCount = needNewDecoration(editor.view, opts, applied);
-
+            // Geometry moved to the debounced view-layer check; rebuild only on
+            // its meta tr or a config change.
             if (
-              (pageCount > 1 ? pageCount : 1) !== currentPageCount ||
-              recalculatePageCount ||
+              tr.getMeta(page_count_meta_key) !== undefined ||
               applied.pageBreakBackground !== opts.pageBreakBackground ||
               applied.pageHeight !== opts.pageHeight ||
               applied.pageWidth !== opts.pageWidth ||
@@ -295,7 +364,6 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
             ) {
               const widgetList = createDecoration(newState, opts);
               applied = {...opts};
-              newState.tr.setMeta(page_count_meta_key, Date.now())
               return DecorationSet.create(newState.doc, [...widgetList]);
             }
             return oldDeco;
@@ -307,31 +375,28 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
             return this.getState(state) as DecorationSet;
           },
         },
+
+        view: () => ({
+          update: (view, prevState) => {
+            // Selection-only transactions keep the same doc object.
+            if (view.state.doc !== prevState.doc) {
+              this.storage.scheduleCheck?.();
+            }
+          },
+        }),
       }),
       new Plugin({
         key: new PluginKey('brDecoration'),
         state: {
-          init() { return DecorationSet.empty },
+          init(_, state) { return buildBrDecorations(state.doc); },
           apply(tr, old) {
-            // Map decorations through document changes
-            return old.map(tr.mapping, tr.doc);
+            // Positions only change when the doc does; otherwise reuse the set.
+            return tr.docChanged ? buildBrDecorations(tr.doc) : old;
           }
         },
         props: {
           decorations(state) {
-            const decorations: Decoration[] = [];
-            state.doc.descendants((node, pos) => {
-              if (node.type.name === 'hardBreak') {
-                const afterPos = pos + 1;
-                const widget = Decoration.widget(afterPos, () => {
-                  const el = document.createElement('span');
-                  el.classList.add('rm-br-decoration');
-                  return el;
-                });
-                decorations.push(widget);
-              }
-            });
-            return DecorationSet.create(state.doc, decorations);
+            return (this as Plugin).getState(state) as DecorationSet;
           }
         }
       }),
@@ -390,6 +455,19 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions>({
   },
 });
 
+const buildBrDecorations = (doc: EditorState["doc"]): DecorationSet => {
+  const decorations: Decoration[] = [];
+  doc.descendants((node, pos) => {
+    if (node.type.name === "hardBreak") {
+      decorations.push(Decoration.widget(pos + 1, () => {
+        const el = document.createElement("span");
+        el.classList.add("rm-br-decoration");
+        return el;
+      }));
+    }
+  });
+  return DecorationSet.create(doc, decorations);
+};
 const getExistingPageCount = (view: EditorView) => {
   const editorDom = view.dom;
   const paginationElement = editorDom.querySelector("[data-rm-pagination]");
@@ -439,9 +517,7 @@ const calculatePageCount = (
   pageOptions: PaginationPlusOptions
 ) => {
   const editorDom = view.dom;
-  updateCssVariables(editorDom, pageOptions);
-  const headerHeight = editorDom.querySelector(".rm-first-page-header")?.clientHeight || 0;
-  const footerHeight = editorDom.querySelector(".rm-page-footer")?.clientHeight || 0;
+  const { headerHeight, footerHeight } = updateCssVariables(editorDom, pageOptions);
 
   const _pageHeaderHeight = pageOptions.contentMarginTop + pageOptions.marginTop + headerHeight;
   const _pageFooterHeight = pageOptions.contentMarginBottom + pageOptions.marginBottom + footerHeight;
@@ -453,32 +529,40 @@ const calculatePageCount = (
   const paginationElement = editorDom.querySelector("[data-rm-pagination]");
   const currentPageCount = getExistingPageCount(view);
   if (paginationElement) {
-    const lastElementOfEditor = editorDom.lastElementChild;
+    // Skip trailing out-of-flow elements (overlays, absolutely positioned
+    // layers): they don't participate in pagination flow.
+    let lastElementOfEditor = editorDom.lastElementChild;
+    while (
+      lastElementOfEditor &&
+      (lastElementOfEditor.getAttribute("data-type") === "block-layer" ||
+        ["absolute", "fixed"].indexOf(getComputedStyle(lastElementOfEditor).position) !== -1)
+    ) {
+      lastElementOfEditor = lastElementOfEditor.previousElementSibling;
+    }
     const lastPageBreak =
     paginationElement.lastElementChild?.querySelector(".breaker");
     if (lastElementOfEditor && lastPageBreak) {
       const lastElementRect = lastElementOfEditor.getBoundingClientRect();
       const lastPageBreakRect = lastPageBreak.getBoundingClientRect();
+      // Mid-rebuild DOM (detached/unpainted widgets) measures as 0-rects;
+      // recomputing from garbage explodes the page count. Keep the current one.
+      if (lastPageBreakRect.height === 0 && lastPageBreakRect.bottom === 0) {
+        return currentPageCount;
+      }
       const lastPageGap =
         lastElementRect.bottom -
         lastPageBreakRect.bottom;
+      // One full page cycle (breaker-bottom to breaker-bottom). Add/remove must
+      // both use it, with remove only past a full empty cycle — otherwise the
+      // count overshoots, lands past the opposite threshold and ping-pongs
+      // add⇄remove forever (page-count livelock that freezes the tab).
+      const pageCycle = pageOptions.pageHeight + pageOptions.pageGap;
       if (lastPageGap > 0) {
-        const addPage = Math.ceil(lastPageGap / pageContentAreaHeight);
+        const addPage = Math.ceil(lastPageGap / pageCycle);
         return currentPageCount + addPage;
-      } else {
-        const lpFrom = -10;
-        const lpTo = -(pageOptions.pageHeight - 10);
-        if (lastPageGap > lpTo && lastPageGap < lpFrom) {
-          return currentPageCount;
-        } else if (lastPageGap < lpTo) {
-          const pageHeightOnRemove =
-            pageOptions.pageHeight + pageOptions.pageGap;
-          const removePage = Math.floor(lastPageGap / pageHeightOnRemove);
-          return currentPageCount + removePage;
-        } else {
-          return currentPageCount;
-        }
       }
+      const removePage = Math.floor(-lastPageGap / pageCycle);
+      return Math.max(1, currentPageCount - removePage);
     }
     return 1;
   } else {
