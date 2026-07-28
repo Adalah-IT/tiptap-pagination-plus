@@ -33,6 +33,14 @@ export interface PaginationPlusStorage extends PaginationPlusOptions {
 }
 const page_count_meta_key = "PAGE_COUNT_META_KEY";
 
+/** Tuning for the debounced page-count check. Raise to trade latency for less work. */
+export const PAGINATION_CHECK_TIMING = {
+  /** Idle time after the last change before measuring. */
+  debounceMs: 100,
+  /** Hard ceiling so continuous typing still repaginates. */
+  maxWaitMs: 400,
+};
+
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
     PaginationPlus: {
@@ -280,9 +288,10 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     };
     const scheduleCheck = () => {
       if (trailingTimer !== undefined) { clearTimeout(trailingTimer); }
-      trailingTimer = window.setTimeout(runNow, 150);
-      // maxWait so continuous typing still paginates.
-      if (maxWaitTimer === undefined) { maxWaitTimer = window.setTimeout(runNow, 600); }
+      trailingTimer = window.setTimeout(runNow, PAGINATION_CHECK_TIMING.debounceMs);
+      if (maxWaitTimer === undefined) {
+        maxWaitTimer = window.setTimeout(runNow, PAGINATION_CHECK_TIMING.maxWaitMs);
+      }
     };
     this.storage.scheduleCheck = scheduleCheck;
     this.storage.cancelCheck = clearTimers;
