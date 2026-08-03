@@ -309,13 +309,7 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     observer.observe(targetNode, config);
     this.storage.observer = observer;
     refreshPage(targetNode);
-    // First pass must NOT be debounced: the ~100ms trailing delay would leave
-    // the document showing the scrollHeight-estimated page count from
-    // createDecoration's init path, causing visible layout/anchor drift on load.
-    // The view and decorations are already rendered by the time onCreate fires
-    // (refreshPage() above already reads geometry synchronously), so running the
-    // geometry check + dispatch synchronously here is safe. Later checks
-    // (typing/observer/convergence re-arm) keep the debounce via scheduleCheck().
+    // First pass runs synchronously; debouncing it would flash the estimated page count.
     runNow();
   },
   onDestroy() {
