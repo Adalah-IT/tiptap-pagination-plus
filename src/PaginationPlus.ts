@@ -309,7 +309,8 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     observer.observe(targetNode, config);
     this.storage.observer = observer;
     refreshPage(targetNode);
-    scheduleCheck();
+    // First pass runs synchronously; debouncing it would flash the estimated page count.
+    runNow();
   },
   onDestroy() {
     // Without this the observer keeps the editor view (and its whole doc) alive
