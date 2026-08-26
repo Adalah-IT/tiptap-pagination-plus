@@ -550,9 +550,15 @@ const calculatePageCount = (
       if (lastPageBreakRect.height === 0 && lastPageBreakRect.bottom === 0) {
         return currentPageCount;
       }
+      // getBoundingClientRect is scaled by any ancestor transform (editor zoom)
+      // while pageCycle below is layout px; normalize both to the same unit.
+      const zoomScale =
+        editorDom.offsetWidth > 0
+          ? editorDom.getBoundingClientRect().width / editorDom.offsetWidth
+          : 1;
       const lastPageGap =
-        lastElementRect.bottom -
-        lastPageBreakRect.bottom;
+        (lastElementRect.bottom - lastPageBreakRect.bottom) /
+        (zoomScale > 0 ? zoomScale : 1);
       // One full page cycle (breaker-bottom to breaker-bottom). Add/remove must
       // both use it, with remove only past a full empty cycle — otherwise the
       // count overshoots, lands past the opposite threshold and ping-pongs
