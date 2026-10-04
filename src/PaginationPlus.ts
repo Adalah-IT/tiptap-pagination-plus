@@ -28,6 +28,7 @@ export interface PaginationPlusOptions {
 export interface PaginationPlusStorage extends PaginationPlusOptions {
   styleEl?: HTMLStyleElement;
   observer?: MutationObserver;
+  resizeObserver?: ResizeObserver;
   scheduleCheck?: () => void;
   cancelCheck?: () => void;
 }
@@ -265,8 +266,13 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
             });
           }
         } else {
-          const tr = view.state.tr.setMeta(page_count_meta_key, Date.now());
-          view.dispatch(tr);
+          // Go through tiptap so the tr is built from the state it is applied to;
+          // a raw view.state tr is rejected as mismatched when they diverge (vue-3).
+          this.editor.commands.command(({ tr }) => {
+            tr.setMeta(page_count_meta_key, Date.now());
+            tr.setMeta("addToHistory", false);
+            return true;
+          });
           // Re-arm once so convergence is verified after the rebuild redraws.
           scheduleCheck();
         }
@@ -308,6 +314,18 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     const observer = new MutationObserver(callback);
     observer.observe(targetNode, config);
     this.storage.observer = observer;
+    // Content can grow without a doc change (async node views, fonts, images);
+    // re-check when the editor's height moves so the page count never goes stale.
+    let lastHeight = -1;
+    const resizeObserver = new ResizeObserver((entries) => {
+      const height = entries[entries.length - 1].contentRect.height;
+      if (height !== lastHeight) {
+        lastHeight = height;
+        scheduleCheck();
+      }
+    });
+    resizeObserver.observe(targetNode);
+    this.storage.resizeObserver = resizeObserver;
     refreshPage(targetNode);
     // First pass runs synchronously; debouncing it would flash the estimated page count.
     runNow();
@@ -320,6 +338,8 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     this.storage.cancelCheck = undefined;
     this.storage.observer?.disconnect();
     this.storage.observer = undefined;
+    this.storage.resizeObserver?.disconnect();
+    this.storage.resizeObserver = undefined;
     this.storage.styleEl?.remove();
     this.storage.styleEl = undefined;
   },
