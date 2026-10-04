@@ -29,6 +29,7 @@ export interface PaginationPlusStorage extends PaginationPlusOptions {
   styleEl?: HTMLStyleElement;
   observer?: MutationObserver;
   resizeObserver?: ResizeObserver;
+  offFontsLoaded?: () => void;
   scheduleCheck?: () => void;
   cancelCheck?: () => void;
 }
@@ -270,7 +271,6 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
           // a raw view.state tr is rejected as mismatched when they diverge (vue-3).
           this.editor.commands.command(({ tr }) => {
             tr.setMeta(page_count_meta_key, Date.now());
-            tr.setMeta("addToHistory", false);
             return true;
           });
           // Re-arm once so convergence is verified after the rebuild redraws.
@@ -326,6 +326,10 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     });
     resizeObserver.observe(targetNode);
     this.storage.resizeObserver = resizeObserver;
+    // Shrinking content is hidden by the pinned min-height, so re-check when fonts swap in.
+    const fonts = typeof document !== "undefined" ? document.fonts : undefined;
+    fonts?.addEventListener("loadingdone", scheduleCheck);
+    this.storage.offFontsLoaded = () => fonts?.removeEventListener("loadingdone", scheduleCheck);
     refreshPage(targetNode);
     // First pass runs synchronously; debouncing it would flash the estimated page count.
     runNow();
@@ -340,6 +344,8 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     this.storage.observer = undefined;
     this.storage.resizeObserver?.disconnect();
     this.storage.resizeObserver = undefined;
+    this.storage.offFontsLoaded?.();
+    this.storage.offFontsLoaded = undefined;
     this.storage.styleEl?.remove();
     this.storage.styleEl = undefined;
   },
