@@ -28,8 +28,12 @@ export interface PaginationPlusOptions {
 export interface PaginationPlusStorage extends PaginationPlusOptions {
   styleEl?: HTMLStyleElement;
   observer?: MutationObserver;
+  resizeObserver?: ResizeObserver;
   scheduleCheck?: () => void;
   cancelCheck?: () => void;
+  /** Resolves once no check is pending and the last one left the page count unchanged. */
+  whenSettled?: () => Promise<void>;
+  releaseSettled?: () => void;
 }
 const page_count_meta_key = "PAGE_COUNT_META_KEY";
 
@@ -247,8 +251,47 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     // (divergent geometry), stop feeding the observer→dispatch cycle instead
     // of livelocking the tab. Recovers on the next natural mutation.
     let dispatchTimes: number[] = [];
+    let observedBlocks = new Set<Element>();
+    const observeBlocks = () => {
+      const observer = this.storage.resizeObserver;
+      if (!observer) { return; }
+      const current = new Set<Element>();
+      for (const child of Array.from(targetNode.children)) {
+        if (child.hasAttribute("data-rm-pagination")) { continue; }
+        current.add(child);
+        if (!observedBlocks.has(child)) { observer.observe(child); }
+      }
+      observedBlocks.forEach((child) => { if (!current.has(child)) { observer.unobserve(child); } });
+      observedBlocks = current;
+    };
+    // Settled = the last check changed nothing and none is pending; confirmed two frames
+    // later so a ResizeObserver re-arm caused by that check's own style write still counts.
+    let settled = false;
+    let settleEpoch = 0;
+    let settleWaiters: Array<() => void> = [];
+    const markSettled = () => {
+      settled = true;
+      const waiters = settleWaiters;
+      settleWaiters = [];
+      waiters.forEach((resolve) => resolve());
+    };
+    const confirmSettled = () => {
+      const epoch = settleEpoch;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (epoch === settleEpoch && trailingTimer === undefined && maxWaitTimer === undefined) {
+          markSettled();
+        }
+      }));
+    };
+    // Always re-check first: layout may have changed since the last check without one being scheduled yet.
+    this.storage.whenSettled = () => {
+      scheduleCheck();
+      return new Promise<void>((resolve) => settleWaiters.push(resolve));
+    };
+    this.storage.releaseSettled = markSettled;
     const perform = () => {
       if (this.editor.isDestroyed) { return; }
+      let rearmed = false;
       const view = this.editor.view;
       const currentPageCount = getExistingPageCount(view);
       const pageCount = calculatePageCount(view, this.storage);
@@ -264,16 +307,27 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
               pageCount,
             });
           }
+          // Paused: never leave whenSettled() callers hanging.
+          markSettled();
         } else {
-          const tr = view.state.tr.setMeta(page_count_meta_key, Date.now());
-          view.dispatch(tr);
+          // Go through tiptap so the tr is built from the state it is applied to;
+          // a raw view.state tr is rejected as mismatched when they diverge (vue-3).
+          this.editor.commands.command(({ tr }) => {
+            tr.setMeta(page_count_meta_key, Date.now());
+            return true;
+          });
           // Re-arm once so convergence is verified after the rebuild redraws.
           scheduleCheck();
+          rearmed = true;
         }
       }
       refreshPage(targetNode);
+      observeBlocks();
       // perform() writes style on the observed node; drop the records it caused.
       this.storage.observer?.takeRecords();
+      if (!rearmed && !settled) {
+        confirmSettled();
+      }
     };
     // Debounce: coalesce keystroke bursts into one post-redraw geometry read.
     let trailingTimer: number | undefined;
@@ -287,6 +341,8 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
       perform();
     };
     const scheduleCheck = () => {
+      settled = false;
+      settleEpoch++;
       if (trailingTimer !== undefined) { clearTimeout(trailingTimer); }
       trailingTimer = window.setTimeout(runNow, PAGINATION_CHECK_TIMING.debounceMs);
       if (maxWaitTimer === undefined) {
@@ -308,6 +364,26 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     const observer = new MutationObserver(callback);
     observer.observe(targetNode, config);
     this.storage.observer = observer;
+    // Content can resize without a doc change (async node views, fonts, images). The editor's
+    // pinned min-height hides shrinking, so each top-level block is watched too.
+    const heights = new WeakMap<Element, number>();
+    const resizeObserver = new ResizeObserver((entries) => {
+      let changed = false;
+      for (const entry of entries) {
+        const height = entry.contentRect.height;
+        const last = heights.get(entry.target);
+        heights.set(entry.target, height);
+        if (entry.target === targetNode ? last !== height : last !== undefined && last !== height) {
+          changed = true;
+        }
+      }
+      if (changed) {
+        scheduleCheck();
+      }
+    });
+    resizeObserver.observe(targetNode);
+    this.storage.resizeObserver = resizeObserver;
+    observeBlocks();
     refreshPage(targetNode);
     // First pass runs synchronously; debouncing it would flash the estimated page count.
     runNow();
@@ -316,10 +392,15 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     // Without this the observer keeps the editor view (and its whole doc) alive
     // after destroy(), and every editor leaks another <style> into <head>.
     this.storage.cancelCheck?.();
+    this.storage.releaseSettled?.();
+    this.storage.releaseSettled = undefined;
+    this.storage.whenSettled = undefined;
     this.storage.scheduleCheck = undefined;
     this.storage.cancelCheck = undefined;
     this.storage.observer?.disconnect();
     this.storage.observer = undefined;
+    this.storage.resizeObserver?.disconnect();
+    this.storage.resizeObserver = undefined;
     this.storage.styleEl?.remove();
     this.storage.styleEl = undefined;
   },
