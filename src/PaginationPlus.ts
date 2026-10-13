@@ -29,7 +29,6 @@ export interface PaginationPlusStorage extends PaginationPlusOptions {
   styleEl?: HTMLStyleElement;
   observer?: MutationObserver;
   resizeObserver?: ResizeObserver;
-  offFontsLoaded?: () => void;
   scheduleCheck?: () => void;
   cancelCheck?: () => void;
   /** Resolves once no check is pending and the last one left the page count unchanged. */
@@ -252,6 +251,19 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     // (divergent geometry), stop feeding the observer→dispatch cycle instead
     // of livelocking the tab. Recovers on the next natural mutation.
     let dispatchTimes: number[] = [];
+    let observedBlocks = new Set<Element>();
+    const observeBlocks = () => {
+      const observer = this.storage.resizeObserver;
+      if (!observer) { return; }
+      const current = new Set<Element>();
+      for (const child of Array.from(targetNode.children)) {
+        if (child.hasAttribute("data-rm-pagination")) { continue; }
+        current.add(child);
+        if (!observedBlocks.has(child)) { observer.observe(child); }
+      }
+      observedBlocks.forEach((child) => { if (!current.has(child)) { observer.unobserve(child); } });
+      observedBlocks = current;
+    };
     // Settled = the last check changed nothing and none is pending; confirmed two frames
     // later so a ResizeObserver re-arm caused by that check's own style write still counts.
     let settled = false;
@@ -271,8 +283,11 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
         }
       }));
     };
-    this.storage.whenSettled = () =>
-      settled ? Promise.resolve() : new Promise<void>((resolve) => settleWaiters.push(resolve));
+    // Always re-check first: layout may have changed since the last check without one being scheduled yet.
+    this.storage.whenSettled = () => {
+      scheduleCheck();
+      return new Promise<void>((resolve) => settleWaiters.push(resolve));
+    };
     this.storage.releaseSettled = markSettled;
     const perform = () => {
       if (this.editor.isDestroyed) { return; }
@@ -307,6 +322,7 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
         }
       }
       refreshPage(targetNode);
+      observeBlocks();
       // perform() writes style on the observed node; drop the records it caused.
       this.storage.observer?.takeRecords();
       if (!rearmed && !settled) {
@@ -348,22 +364,26 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     const observer = new MutationObserver(callback);
     observer.observe(targetNode, config);
     this.storage.observer = observer;
-    // Content can grow without a doc change (async node views, fonts, images);
-    // re-check when the editor's height moves so the page count never goes stale.
-    let lastHeight = -1;
+    // Content can resize without a doc change (async node views, fonts, images). The editor's
+    // pinned min-height hides shrinking, so each top-level block is watched too.
+    const heights = new WeakMap<Element, number>();
     const resizeObserver = new ResizeObserver((entries) => {
-      const height = entries[entries.length - 1].contentRect.height;
-      if (height !== lastHeight) {
-        lastHeight = height;
+      let changed = false;
+      for (const entry of entries) {
+        const height = entry.contentRect.height;
+        const last = heights.get(entry.target);
+        heights.set(entry.target, height);
+        if (entry.target === targetNode ? last !== height : last !== undefined && last !== height) {
+          changed = true;
+        }
+      }
+      if (changed) {
         scheduleCheck();
       }
     });
     resizeObserver.observe(targetNode);
     this.storage.resizeObserver = resizeObserver;
-    // Shrinking content is hidden by the pinned min-height, so re-check when fonts swap in.
-    const fonts = typeof document !== "undefined" ? document.fonts : undefined;
-    fonts?.addEventListener("loadingdone", scheduleCheck);
-    this.storage.offFontsLoaded = () => fonts?.removeEventListener("loadingdone", scheduleCheck);
+    observeBlocks();
     refreshPage(targetNode);
     // First pass runs synchronously; debouncing it would flash the estimated page count.
     runNow();
@@ -381,8 +401,6 @@ export const PaginationPlus = Extension.create<PaginationPlusOptions, Pagination
     this.storage.observer = undefined;
     this.storage.resizeObserver?.disconnect();
     this.storage.resizeObserver = undefined;
-    this.storage.offFontsLoaded?.();
-    this.storage.offFontsLoaded = undefined;
     this.storage.styleEl?.remove();
     this.storage.styleEl = undefined;
   },
